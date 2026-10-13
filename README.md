@@ -2,6 +2,10 @@
 
 A beginner-friendly Retrieval-Augmented Generation app using FastAPI, Streamlit, Gemini, and FAISS.
 
+
+## UI
+![DocuMind Screenshot](documind-ui.png)
+
 ## Features
 
 - Upload PDF, TXT, and Markdown documents
