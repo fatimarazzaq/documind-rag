@@ -1,0 +1,11 @@
+fastapi>=0.115,<1.0
+uvicorn[standard]>=0.30
+streamlit>=1.40
+requests>=2.32
+google-genai>=1.0
+faiss-cpu>=1.9
+numpy>=1.26
+pypdf>=5.0
+python-multipart>=0.0.12
+python-dotenv>=1.0
+pytest>=8.0
