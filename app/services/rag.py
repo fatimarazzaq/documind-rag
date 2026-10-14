@@ -1,7 +1,8 @@
 import json
 import re
+import uuid
 from pathlib import Path
-from threading import RLock
+from threading import Lock, RLock
 
 import faiss
 import numpy as np
@@ -13,20 +14,27 @@ from app.services.document_loader import extract_text, split_text
 
 
 class RAGService:
-    def __init__(self):
-        self.data_dir = settings.data_dir
+    _locks_guard = Lock()
+    _user_locks = {}
+
+    def __init__(self, user_id: str, api_key: str):
+        with self._locks_guard:
+            self.lock = self._user_locks.setdefault(user_id, RLock())
+        self.data_dir = settings.data_dir / "users" / user_id
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.index_path = self.data_dir / "vectors.faiss"
         self.metadata_path = self.data_dir / "chunks.json"
-        self.lock = RLock()
-        self.client = genai.Client(api_key=settings.gemini_api_key) if settings.gemini_api_key else None
+        self.documents_dir = self.data_dir / "documents"
+        self.documents_dir.mkdir(parents=True, exist_ok=True)
+        self.client = genai.Client(api_key=api_key) if api_key else None
         self.index = None
         self.chunks = []
-        self._load_index()
+        with self.lock:
+            self._load_index()
 
     def _require_client(self):
         if not self.client:
-            raise RuntimeError("Gemini API key is missing. Add GEMINI_API_KEY to your .env file and restart the API.")
+            raise RuntimeError("Enter your Gemini API key to use document search.")
 
     @property
     def has_chunks(self):
@@ -37,19 +45,35 @@ class RAGService:
         return len({c["source"] for c in self.chunks})
 
     def list_documents(self):
+        with self.lock:
+            self._load_index()
         docs = {}
         for chunk in self.chunks:
-            docs[chunk["source"]] = docs.get(chunk["source"], 0) + 1
-        return [{"filename": name, "chunks": count} for name, count in sorted(docs.items())]
+            document = docs.setdefault(
+                chunk["document_id"],
+                {"id": chunk["document_id"], "filename": chunk["source"], "chunks": 0},
+            )
+            document["chunks"] += 1
+        return sorted(docs.values(), key=lambda document: document["filename"].lower())
 
     def _load_index(self):
-        if self.index_path.exists() and self.metadata_path.exists():
-            try:
-                self.index = faiss.read_index(str(self.index_path))
-                self.chunks = json.loads(self.metadata_path.read_text(encoding="utf-8"))
-            except Exception:
-                self.index = None
-                self.chunks = []
+        index_exists = self.index_path.exists()
+        metadata_exists = self.metadata_path.exists()
+        if not index_exists and not metadata_exists:
+            self.index = None
+            self.chunks = []
+            return
+        if index_exists != metadata_exists:
+            raise RuntimeError("Your saved document index is incomplete. Restore its files from backup.")
+        try:
+            index = faiss.read_index(str(self.index_path))
+            chunks = json.loads(self.metadata_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, RuntimeError) as exc:
+            raise RuntimeError("Could not load your saved document index.") from exc
+        if not isinstance(chunks, list) or len(chunks) != index.ntotal:
+            raise RuntimeError("Your saved document index does not match its passage metadata.")
+        self.index = index
+        self.chunks = chunks
 
     def _embed(self, texts, task_type):
         self._require_client()
@@ -75,17 +99,27 @@ class RAGService:
     def _persist(self):
         if self.index is not None:
             faiss.write_index(self.index, str(self.index_path))
+        else:
+            if self.index_path.exists():
+                self.index_path.unlink()
+            if not self.chunks:
+                if self.metadata_path.exists():
+                    self.metadata_path.unlink()
+                return
         self.metadata_path.write_text(json.dumps(self.chunks, ensure_ascii=False, indent=2), encoding="utf-8")
 
     def add_document(self, filename: str, suffix: str, data: bytes):
         with self.lock:
+            self._load_index()
             text = extract_text(filename, suffix, data)
             pieces = split_text(text, settings.chunk_size, settings.chunk_overlap)
             if not pieces:
                 raise ValueError("No text was found in the document.")
             vectors = self._embed(pieces, "RETRIEVAL_DOCUMENT")
-            # A repeated filename replaces its previous chunks.
-            keep = [item for item in self.chunks if item["source"] != filename]
+            document_id = str(uuid.uuid4())
+            # Replacing a filename also replaces its stored original.
+            replaced_ids = {item["document_id"] for item in self.chunks if item["source"] == filename}
+            keep = [item for item in self.chunks if item["document_id"] not in replaced_ids]
             if len(keep) != len(self.chunks):
                 self.chunks = keep
                 self._rebuild_index()
@@ -95,11 +129,65 @@ class RAGService:
                 raise RuntimeError("Embedding dimensions changed. Clear the data/ folder and upload documents again.")
             self.index.add(vectors)
             self.chunks.extend([
-                {"source": filename, "chunk_id": i + 1, "text": piece}
+                {"document_id": document_id, "source": filename, "chunk_id": i + 1, "text": piece}
                 for i, piece in enumerate(pieces)
             ])
+            for replaced_id in replaced_ids:
+                old_file = self.documents_dir / f"{replaced_id}.bin"
+                if old_file.exists():
+                    old_file.unlink()
+            (self.documents_dir / f"{document_id}.bin").write_bytes(data)
             self._persist()
-            return {"message": "Document indexed successfully.", "filename": filename, "chunks_added": len(pieces)}
+            return {
+                "message": "Document indexed successfully.",
+                "id": document_id,
+                "filename": filename,
+                "chunks_added": len(pieces),
+            }
+
+    def delete_document(self, document_id: str):
+        with self.lock:
+            self._load_index()
+            removed_chunks = [
+                chunk for chunk in self.chunks
+                if chunk["document_id"] == document_id
+            ]
+            if not removed_chunks:
+                raise ValueError("Document not found in your library.")
+
+            if self.index is None:
+                raise RuntimeError("The saved document index is unavailable.")
+
+            removed_positions = {
+                position for position, chunk in enumerate(self.chunks)
+                if chunk["document_id"] == document_id
+            }
+            kept_chunks = [
+                chunk for position, chunk in enumerate(self.chunks)
+                if position not in removed_positions
+            ]
+            vectors = self.index.reconstruct_n(0, self.index.ntotal)
+            kept_vectors = vectors[
+                [position for position in range(len(self.chunks)) if position not in removed_positions]
+            ]
+
+            if kept_chunks:
+                new_index = faiss.IndexFlatIP(kept_vectors.shape[1])
+                new_index.add(kept_vectors)
+                self.index = new_index
+            else:
+                self.index = None
+            self.chunks = kept_chunks
+            self._persist()
+
+            stored_file = self.documents_dir / f"{document_id}.bin"
+            if stored_file.exists():
+                stored_file.unlink()
+            return {
+                "message": "Document deleted successfully.",
+                "id": document_id,
+                "filename": removed_chunks[0]["source"],
+            }
 
     def _rebuild_index(self):
         if not self.chunks:
@@ -111,15 +199,32 @@ class RAGService:
         self.index = faiss.IndexFlatIP(vectors.shape[1])
         self.index.add(vectors)
 
-    def answer(self, question: str, top_k: int = 4):
+    def answer(self, question: str, top_k: int = 4, document_id: str | None = None):
         with self.lock:
+            self._load_index()
+            if not self.chunks or self.index is None:
+                raise ValueError("Upload a document before asking a question.")
+            chunk_positions = [
+                position for position, chunk in enumerate(self.chunks)
+                if document_id is None or chunk["document_id"] == document_id
+            ]
+            if document_id is not None and not chunk_positions:
+                raise ValueError("The selected document was not found in your library.")
             query_vector = self._embed([question], "RETRIEVAL_QUERY")
-            scores, positions = self.index.search(query_vector, min(top_k, len(self.chunks)))
+            index = self.index
+            chunks = self.chunks
+            if document_id is not None:
+                all_vectors = self.index.reconstruct_n(0, self.index.ntotal)
+                selected_vectors = all_vectors[chunk_positions]
+                index = faiss.IndexFlatIP(selected_vectors.shape[1])
+                index.add(selected_vectors)
+                chunks = [self.chunks[position] for position in chunk_positions]
+            scores, positions = index.search(query_vector, min(top_k, len(chunks)))
             sources = []
             for score, pos in zip(scores[0], positions[0]):
                 if pos < 0:
                     continue
-                chunk = self.chunks[int(pos)]
+                chunk = chunks[int(pos)]
                 sources.append({
                     "filename": chunk["source"],
                     "chunk_id": chunk["chunk_id"],
@@ -147,6 +252,3 @@ QUESTION:
         except Exception as exc:
             raise RuntimeError(f"Gemini answer generation failed: {exc}") from exc
         return {"answer": response.text or "Gemini returned an empty response.", "sources": sources}
-
-
-rag_service = RAGService()

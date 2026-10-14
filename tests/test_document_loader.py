@@ -1,4 +1,8 @@
-from app.services.document_loader import split_text
+from io import BytesIO
+
+from docx import Document
+
+from app.services.document_loader import extract_text, split_text
 
 
 def test_split_text_returns_chunks():
@@ -10,3 +14,12 @@ def test_split_text_returns_chunks():
 
 def test_split_text_empty():
     assert split_text("   ", chunk_size=100, overlap=10) == []
+
+
+def test_extract_text_from_word_document():
+    file = BytesIO()
+    document = Document()
+    document.add_paragraph("A private document.")
+    document.save(file)
+
+    assert "A private document." in extract_text("notes.docx", ".docx", file.getvalue())

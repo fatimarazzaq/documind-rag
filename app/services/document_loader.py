@@ -14,6 +14,23 @@ def extract_text(filename: str, suffix: str, data: bytes) -> str:
         if not text.strip():
             raise ValueError("No selectable text found in this PDF. Scanned PDFs need OCR.")
         return text
+    if suffix == ".docx":
+        try:
+            from docx import Document
+
+            document = Document(BytesIO(data))
+            text = "\n".join(paragraph.text for paragraph in document.paragraphs)
+            text += "\n" + "\n".join(
+                cell.text
+                for table in document.tables
+                for row in table.rows
+                for cell in row.cells
+            )
+        except Exception as exc:
+            raise ValueError(f"Could not read this Word document: {exc}") from exc
+        if not text.strip():
+            raise ValueError("No text was found in this Word document.")
+        return text
     try:
         return data.decode("utf-8-sig")
     except UnicodeDecodeError as exc:
